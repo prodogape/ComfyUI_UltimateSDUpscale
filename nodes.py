@@ -113,13 +113,13 @@ class UltimateSDUpscale:
         self.tile_height = tile_height
         self.mask_blur = mask_blur
         self.tile_padding = tile_padding
-        self.seam_fix_width = seam_fix_width
-        self.seam_fix_denoise = seam_fix_denoise
-        self.seam_fix_padding = seam_fix_padding
-        self.seam_fix_mode = seam_fix_mode
-        self.mode_type = mode_type
+        self.seam_fix_width = seam_fix_width  #TODO deprecated
+        self.seam_fix_denoise = seam_fix_denoise  #TODO deprecated
+        self.seam_fix_padding = seam_fix_padding  #TODO deprecated
+        self.seam_fix_mode = seam_fix_mode  #TODO deprecated
+        self.mode_type = mode_type  #TODO deprecated
         self.upscale_by = upscale_by
-        self.seam_fix_mask_blur = seam_fix_mask_blur
+        self.seam_fix_mask_blur = seam_fix_mask_blur  #TODO deprecated
 
         # Convert mask tensor to PIL Image
         if len(mask.shape) == 2:
@@ -131,49 +131,31 @@ class UltimateSDUpscale:
         if mask_pil.mode != "L":
             mask_pil = mask_pil.convert("L")
 
-        # Get the bounding box of the white area in the mask
-        bbox = mask_pil.getbbox()
-        if bbox is None:
-            # If no white pixels, just upscale the entire image using simple resize
-            target_w = int(image.shape[2] * upscale_by)
-            target_h = int(image.shape[1] * upscale_by)
-            resized_images = [tensor_to_pil(image, i).resize((target_w, target_h), Image.LANCZOS) 
-                            for i in range(len(image))]
-            images = [pil_to_tensor(img) for img in resized_images]
-            return (torch.cat(images, dim=0),)
-
-        # Extract the region of interest from the image and mask
-        x1, y1, x2, y2 = bbox
-        # Add padding to ensure proper context
-        pad = max(tile_padding, seam_fix_padding)
-        x1 = max(0, x1 - pad)
-        y1 = max(0, y1 - pad)
-        x2 = min(mask_pil.width, x2 + pad)
-        y2 = min(mask_pil.height, y2 + pad)
-
-        # Convert image to PIL for processing
-        pil_images = [tensor_to_pil(image, i) for i in range(len(image))]
-        # Crop the region of interest from both image and mask
-        roi_images = [img.crop((x1, y1, x2, y2)) for img in pil_images]
-        roi_mask = mask_pil.crop((x1, y1, x2, y2))
+        # Resize mask to match upscaled dimensions
+        target_w = int(image.shape[2] * upscale_by)
+        target_h = int(image.shape[1] * upscale_by)
+        mask_pil = mask_pil.resize((target_w, target_h), Image.LANCZOS)
 
         #
         # Set up A1111 patches
         #
 
-        # Upscaler setup
+        # Upscaler
+        # An object that the script works with
         shared.sd_upscalers[0] = UpscalerData()
+        # Where the actual upscaler is stored, will be used when the script upscales using the Upscaler in UpscalerData
         shared.actual_upscaler = upscale_model
 
-        # Set the batch of images to the cropped region
-        shared.batch = roi_images
+        # Set the batch of images
+        shared.batch = [tensor_to_pil(image, i) for i in range(len(image))]
 
         # Store original images for later composition
-        original_images = pil_images
+        original_images = [img.copy() for img in shared.batch]
+        original_size = original_images[0].size
 
         # Processing
         sdprocessing = StableDiffusionProcessing(
-            roi_images[0], model, positive, negative, vae,
+            tensor_to_pil(image), model, positive, negative, vae,
             seed, steps, cfg, sampler_name, scheduler, denoise, upscale_by, force_uniform_tiles, tiled_decode,
             tile_width, tile_height, MODES[self.mode_type], SEAM_FIX_MODES[self.seam_fix_mode],
             custom_sampler, custom_sigmas,
@@ -184,7 +166,9 @@ class UltimateSDUpscale:
         old_level = logger.getEffectiveLevel()
         logger.setLevel(logging.CRITICAL + 1)
         try:
-            # Running the script on the cropped region
+            #
+            # Running the script
+            #
             script = usdu.Script()
             processed = script.run(p=sdprocessing, _=None, tile_width=self.tile_width, tile_height=self.tile_height,
                                mask_blur=self.mask_blur, padding=self.tile_padding, seams_fix_width=self.seam_fix_width,
@@ -194,35 +178,18 @@ class UltimateSDUpscale:
                                seams_fix_type=SEAM_FIX_MODES[self.seam_fix_mode], target_size_type=2,
                                custom_width=None, custom_height=None, custom_scale=self.upscale_by)
 
-            # Calculate upscaled dimensions
-            target_w = int(image.shape[2] * upscale_by)
-            target_h = int(image.shape[1] * upscale_by)
-            # Resize mask to match final dimensions
-            mask_pil = mask_pil.resize((target_w, target_h), Image.LANCZOS)
-            
-            # Process each image in the batch
-            final_images = []
-            for i, (upscaled_roi, original) in enumerate(zip(shared.batch, original_images)):
-                # Resize original image to target size
-                resized_original = original.resize((target_w, target_h), Image.LANCZOS)
-                
-                # Calculate upscaled ROI coordinates
-                up_x1 = int(x1 * upscale_by)
-                up_y1 = int(y1 * upscale_by)
-                up_x2 = int(x2 * upscale_by)
-                up_y2 = int(y2 * upscale_by)
-                
-                # Create a new image with the upscaled size
-                result = resized_original.copy()
-                # Paste the upscaled ROI into the correct position
-                result.paste(upscaled_roi, (up_x1, up_y1))
-                # Use the mask to blend
-                result = Image.composite(result, resized_original, mask_pil)
-                final_images.append(result)
+            # Compose the upscaled result with original image using the mask
+            for i, (upscaled, original) in enumerate(zip(shared.batch, original_images)):
+                # Resize original to match upscaled size
+                original_upscaled = original.resize(upscaled.size, Image.LANCZOS)
+                # Create composite
+                result = Image.composite(upscaled, original_upscaled, mask_pil)
+                shared.batch[i] = result
 
-            # Convert back to tensor
-            images = [pil_to_tensor(img) for img in final_images]
-            return (torch.cat(images, dim=0),)
+            # Return the resulting images
+            images = [pil_to_tensor(img) for img in shared.batch]
+            tensor = torch.cat(images, dim=0)
+            return (tensor,)
         finally:
             # Restore the original logging level
             logger.setLevel(old_level)
